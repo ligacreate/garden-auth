@@ -93,7 +93,8 @@ app.post('/auth/register', async (req, res) => {
   const { email, password, name, city } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
-    const existing = await pool.query('select id from public.users_auth where email = $1', [email]);
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const existing = await pool.query('select id from public.users_auth where email = $1', [normalizedEmail]);
     if (existing.rows.length) return res.status(409).json({ error: 'User already exists' });
 
     const id = uuidv4();
@@ -101,18 +102,18 @@ app.post('/auth/register', async (req, res) => {
 
     await pool.query(
       'insert into public.users_auth (id, email, password_hash, status) values ($1,$2,$3,$4)',
-      [id, email, hash, 'active']
+      [id, normalizedEmail, hash, 'active']
     );
 
     await pool.query(
       `insert into public.profiles (id, email, name, city, role, status, seeds)
        values ($1,$2,$3,$4,$5,$6,$7)
        on conflict (id) do update set email=excluded.email, name=excluded.name, city=excluded.city`,
-      [id, email, name || null, city || null, 'applicant', 'active', 0]
+      [id, normalizedEmail, name || null, city || null, 'applicant', 'active', 0]
     );
 
-    const token = signToken({ sub: id, email });
-    res.json({ token, user: { id, email, name, city, role: 'applicant' } });
+    const token = signToken({ sub: id, email: normalizedEmail });
+    res.json({ token, user: { id, email: normalizedEmail, name, city, role: 'applicant' } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -122,7 +123,8 @@ app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
-    const { rows } = await pool.query('select id, password_hash, status from public.users_auth where email = $1', [email]);
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const { rows } = await pool.query('select id, password_hash, status from public.users_auth where email = $1', [normalizedEmail]);
     if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const user = rows[0];
     if (user.status !== 'active') return res.status(403).json({ error: 'Account suspended' });
@@ -131,8 +133,8 @@ app.post('/auth/login', async (req, res) => {
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
     const profile = await pool.query('select * from public.profiles where id = $1', [user.id]);
-    const token = signToken({ sub: user.id, email });
-    res.json({ token, user: profile.rows[0] || { id: user.id, email } });
+    const token = signToken({ sub: user.id, email: normalizedEmail });
+    res.json({ token, user: profile.rows[0] || { id: user.id, email: normalizedEmail } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
