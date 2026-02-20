@@ -152,8 +152,13 @@ app.post('/auth/request-reset', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
   try {
-    const { rows } = await pool.query('select id from public.users_auth where email = $1', [email]);
-    if (!rows.length) return res.json({ ok: true });
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const { rows } = await pool.query('select id from public.users_auth where email = $1', [normalizedEmail]);
+    if (!rows.length) return res.status(404).json({ error: 'Email not found' });
+
+    if (!transporter) {
+      return res.status(500).json({ error: 'SMTP not configured' });
+    }
 
     const rawToken = crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
@@ -161,21 +166,20 @@ app.post('/auth/request-reset', async (req, res) => {
 
     await pool.query(
       'update public.users_auth set reset_token=$1, reset_expires=$2 where email=$3',
-      [tokenHash, expires, email]
+      [tokenHash, expires, normalizedEmail]
     );
 
-    if (transporter) {
-      const resetUrl = `${PUBLIC_URL}/reset?token=${rawToken}`;
-      await transporter.sendMail({
-        from: SMTP_FROM,
-        to: email,
-        subject: 'Восстановление пароля',
-        text: `Ссылка для сброса пароля: ${resetUrl}`
-      });
-    }
+    const resetUrl = `${PUBLIC_URL}/reset?token=${rawToken}`;
+    await transporter.sendMail({
+      from: SMTP_FROM,
+      to: normalizedEmail,
+      subject: 'Восстановление пароля',
+      text: `Ссылка для сброса пароля: ${resetUrl}`
+    });
 
     res.json({ ok: true });
   } catch (e) {
+    console.error('request-reset error', e);
     res.status(500).json({ error: e.message });
   }
 });
