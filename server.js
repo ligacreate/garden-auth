@@ -431,7 +431,6 @@ app.post('/api/tg-bot/webhook/:secret', async (req, res) => {
 
     // 5. Привязка транзакционно: UPDATE profiles + UPDATE tg_link_codes.
     const client = await pool.connect();
-    let userName = null;
     try {
       await client.query('BEGIN');
       await client.query(
@@ -448,11 +447,6 @@ app.post('/api/tg-bot/webhook/:secret', async (req, res) => {
           where code = $2`,
         [tgUserId, code]
       );
-      const { rows: profRows } = await client.query(
-        `select name from public.profiles where id = $1`,
-        [codeRow.profile_id]
-      );
-      userName = profRows[0]?.name || null;
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -462,9 +456,8 @@ app.post('/api/tg-bot/webhook/:secret', async (req, res) => {
     }
 
     // 6. Подтверждение.
-    const greeting = userName ? `, ${escapeHtml(userName)}` : '';
     await sendTgNotification(tgUserId,
-      `✅ Готово${greeting}! Теперь буду писать сюда о ДЗ — когда студентка сдаст, когда ментор проверит. Тихие часы: 23:00–08:00 МСК, в это время ничего не приходит.`);
+      '✅ Готово! Теперь буду писать сюда о том, что происходит с домашними заданиями! Тихие часы: 23:00–08:00 МСК, в это время сообщения копятся и приходят утром.');
   } catch (e) {
     logClientError({
       ts: new Date().toISOString(),
