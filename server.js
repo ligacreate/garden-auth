@@ -166,6 +166,37 @@ const httpsPostJson = (urlStr, jsonBody, timeoutMs = 8000) => new Promise((resol
   req.end();
 });
 
+// IPv4-only GET (тот же обход happy-eyeballs, что и httpsPostJson).
+// Используется в pollTgUpdates ниже для getUpdates с long-polling timeout.
+// Все ошибки → resolve({ok:false,...}), без reject — poll-loop не должен
+// ломаться на одной сбойной итерации.
+const httpsGetJson = (urlStr, timeoutMs = 30000) => new Promise((resolve) => {
+  let url;
+  try { url = new URL(urlStr); } catch (e) { return resolve({ ok: false, status: 0, text: String(e?.message || e) }); }
+  const req = https.request({
+    hostname: url.hostname,
+    port: url.port || 443,
+    path: url.pathname + url.search,
+    method: 'GET',
+    family: 4,
+    timeout: timeoutMs,
+  }, (res) => {
+    let chunks = '';
+    res.setEncoding('utf8');
+    res.on('data', (c) => { chunks += c; });
+    res.on('end', () => {
+      try {
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data: JSON.parse(chunks), text: chunks });
+      } catch (e) {
+        resolve({ ok: false, status: res.statusCode, text: chunks });
+      }
+    });
+  });
+  req.on('error', (e) => resolve({ ok: false, status: 0, text: String(e?.message || e) }));
+  req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, text: 'timeout' }); });
+  req.end();
+});
+
 setInterval(() => {
   const now = Date.now();
   for (const [k, ts] of recentByKey) if (now - ts > 10 * RL_WINDOW_MS) recentByKey.delete(k);
@@ -356,24 +387,14 @@ app.post('/api/client-error', async (req, res) => {
 
 // FEAT-024 — webhook handler для @garden_notifications_bot.
 // Регистрация webhook'а: см. setWebhook в docs/_session/_45 §4.
-app.post('/api/tg-bot/webhook/:secret', async (req, res) => {
-  // 1. Проверка секретного path в URL (если бот не настроен — 404 без шума).
-  if (!TG_NOTIF_WEBHOOK_PATH || req.params.secret !== TG_NOTIF_WEBHOOK_PATH) {
-    return res.status(404).end();
-  }
-  // 2. Опциональная проверка X-Telegram-Bot-Api-Secret-Token (если включали при setWebhook).
-  if (TG_NOTIF_WEBHOOK_SECRET) {
-    const got = req.headers['x-telegram-bot-api-secret-token'];
-    if (got !== TG_NOTIF_WEBHOOK_SECRET) return res.status(403).end();
-  }
-
-  // ACK сразу — TG retry'ит при non-200 в течение 60с, нам это не нужно.
-  res.status(200).end();
-
-  // Дальше — асинхронная обработка update'а. Если упадёт — лог, не retry.
+// FEAT-024 / TG-WEBHOOK-INBOUND-BLOCKED (2026-05-19) — переключение на
+// long-polling. Webhook handler заменён на pure-функцию, которую зовёт
+// pollTgUpdates ниже. Логика парсинга /start + LINK-кода + привязки в
+// profiles + confirm-message сохранена 1:1 из старого webhook-handler'а.
+// См. docs/_session/2026-05-19_70_strategist_tg_webhook_to_polling.md
+const processTgUpdate = async (update) => {
   try {
-    const update = req.body || {};
-    const msg = update.message;
+    const msg = update?.message;
     if (!msg || !msg.from || typeof msg.text !== 'string') return;
 
     const tgUserId = msg.from.id;
@@ -461,11 +482,11 @@ app.post('/api/tg-bot/webhook/:secret', async (req, res) => {
   } catch (e) {
     logClientError({
       ts: new Date().toISOString(),
-      level: 'tg-webhook-handler-error',
+      level: 'tg-update-handler-error',
       error: String(e?.message || e),
     });
   }
-});
+};
 
 const s3Client = (S3_BUCKET && S3_REGION && S3_ACCESS_KEY && S3_SECRET_KEY)
   ? new S3Client({
@@ -834,6 +855,60 @@ const processTgQueueBatch = async () => {
 setInterval(() => {
   processTgQueueBatch().catch((e) => console.error('[tg-queue] unhandled', e));
 }, TG_QUEUE_INTERVAL_MS).unref();
+
+// FEAT-024 / TG-WEBHOOK-INBOUND-BLOCKED (2026-05-19) — long-polling вместо
+// webhook. Timeweb блокирует inbound к 5.129.251.56:443 для TG IP-ranges
+// (требования РКН), outbound к api.telegram.org работает через IPv4-only
+// (см. 2026-05-10 lesson про happy-eyeballs).
+let tgPollOffset = 0;
+const TG_POLL_INTERVAL_MS = 2000;
+const TG_POLL_TIMEOUT_S = 25; // long-poll: TG держит запрос до 25с, экономит трафик
+
+const pollTgUpdates = async () => {
+  if (!TG_NOTIF_API_BASE) return; // бот не настроен — silent skip
+  try {
+    const url = `${TG_NOTIF_API_BASE}/getUpdates?offset=${tgPollOffset}&limit=100&timeout=${TG_POLL_TIMEOUT_S}&allowed_updates=${encodeURIComponent('["message"]')}`;
+    const res = await httpsGetJson(url, (TG_POLL_TIMEOUT_S + 5) * 1000);
+    if (!res.ok || !res.data || !Array.isArray(res.data.result)) {
+      // 409 Conflict — включён webhook ИЛИ другой instance polling'ит.
+      // Громкий лог чтобы оператор заметил.
+      if (res.status === 409) {
+        console.error('[tg-poll] 409 Conflict — webhook still active OR multiple pollers', res.text?.slice(0, 200));
+      } else {
+        console.error('[tg-poll] unexpected response', res.status, res.text?.slice(0, 200));
+      }
+      return;
+    }
+    const updates = res.data.result;
+    if (updates.length === 0) return;
+
+    for (const update of updates) {
+      try {
+        await processTgUpdate(update);
+      } catch (e) {
+        console.error('[tg-poll] handler error for update_id=' + update.update_id, e);
+      }
+      tgPollOffset = update.update_id + 1;
+    }
+  } catch (e) {
+    console.error('[tg-poll] unhandled', e);
+  }
+};
+
+// Рекурсивный setTimeout (не setInterval!) гарантирует ровно ОДИН
+// in-flight getUpdates: следующий вызов планируется только ПОСЛЕ возврата
+// предыдущего. setInterval с интервалом меньше TG_POLL_TIMEOUT_S создавал
+// бы N параллельных long-poll запросов, TG возвращал бы 409 Conflict
+// "make sure that only one bot instance is running" (см. лог 2026-05-19
+// перед фиксом этого паттерна).
+const pollTgLoop = async () => {
+  await pollTgUpdates();
+  setTimeout(pollTgLoop, TG_POLL_INTERVAL_MS).unref();
+};
+
+if (TG_NOTIF_API_BASE) {
+  setTimeout(pollTgLoop, 1000).unref();
+}
 
 app.listen(PORT || 3001, () => {
   console.log(`Auth server running on port ${PORT || 3001}`);
