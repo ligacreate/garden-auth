@@ -694,7 +694,10 @@ app.post('/auth/request-reset', async (req, res) => {
   try {
     const normalizedEmail = String(email).trim().toLowerCase();
     const { rows } = await pool.query('select id from public.users_auth where email = $1', [normalizedEmail]);
-    if (!rows.length) return res.status(404).json({ error: 'Email not found' });
+    if (!rows.length) {
+      console.info(`[request-reset] unknown email: ${normalizedEmail}`);
+      return res.json({ ok: true });  // silent ok для anti-enum (FEAT-025-INFO-DISCLOSURE-FIX)
+    }
 
     if (!transporter) {
       return res.status(500).json({ error: 'SMTP not configured' });
