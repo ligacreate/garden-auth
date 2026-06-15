@@ -549,8 +549,12 @@ app.post('/storage/sign', authMiddleware, async (req, res) => {
 app.post('/auth/register', async (req, res) => {
   const { email, password, name, city, dob, tree, tree_desc, treeDesc, x, y } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  // Email — строчный с момента входа в систему: один источник истины для
+  // users_auth, profiles, JWT, ответа и TG-уведомления. Тот же паттерн, что
+  // в /auth/request-reset, иначе регистрозависимость переедет в profiles.email.
+  const normalizedEmail = String(email).trim().toLowerCase();
   try {
-    const existing = await pool.query('select id from public.users_auth where email = $1', [email]);
+    const existing = await pool.query('select id from public.users_auth where email = $1', [normalizedEmail]);
     if (existing.rows.length) return res.status(409).json({ error: 'User already exists' });
 
     const id = uuidv4();
@@ -558,7 +562,7 @@ app.post('/auth/register', async (req, res) => {
 
     await pool.query(
       'insert into public.users_auth (id, email, password_hash, status) values ($1,$2,$3,$4)',
-      [id, email, hash, 'active']
+      [id, normalizedEmail, hash, 'active']
     );
 
     // FEAT-023 Phase 2: новые регистрации в pending_approval до одобрения админом.
@@ -572,21 +576,21 @@ app.post('/auth/register', async (req, res) => {
           dob, tree, tree_desc, x, y)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        on conflict (id) do update set email=excluded.email, name=excluded.name, city=excluded.city`,
-      [id, email, name || null, city || null,
+      [id, normalizedEmail, name || null, city || null,
        'applicant', 'suspended', 'pending_approval', 0,
        dob || null, tree || null, tree_desc || treeDesc || null,
        x ?? null, y ?? null]
     );
 
-    const token = signToken({ sub: id, email });
+    const token = signToken({ sub: id, email: normalizedEmail });
     res.json({
       token,
-      user: { id, email, name, city, role: 'applicant', access_status: 'pending_approval' }
+      user: { id, email: normalizedEmail, name, city, role: 'applicant', access_status: 'pending_approval' }
     });
 
     // FEAT-023 Phase 2: TG-уведомление админу о новой регистрации.
     // Fire-and-forget: не блокируем регистрацию если TG лагает / не настроен.
-    notifyNewRegistration({ id, name, email, city }).catch((e) => {
+    notifyNewRegistration({ id, name, email: normalizedEmail, city }).catch((e) => {
       logClientError({
         ts: new Date().toISOString(),
         level: 'tg-notify-registration-failed',
