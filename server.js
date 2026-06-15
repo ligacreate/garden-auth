@@ -606,8 +606,12 @@ app.post('/auth/register', async (req, res) => {
 app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  // Email регистронезависим на входе: лукап и JWT по строчному значению —
+  // тот же источник истины, что и в register/request-reset. users_auth.email
+  // в проде весь строчный, поэтому нормализация ввода никого не ломает.
+  const normalizedEmail = String(email).trim().toLowerCase();
   try {
-    const { rows } = await pool.query('select id, password_hash, status from public.users_auth where email = $1', [email]);
+    const { rows } = await pool.query('select id, password_hash, status from public.users_auth where email = $1', [normalizedEmail]);
     if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const user = rows[0];
     if (user.status !== 'active') return res.status(403).json({ error: 'Account suspended' });
@@ -616,8 +620,8 @@ app.post('/auth/login', async (req, res) => {
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
     const profile = await pool.query('select * from public.profiles where id = $1', [user.id]);
-    const token = signToken({ sub: user.id, email });
-    res.json({ token, user: profile.rows[0] || { id: user.id, email } });
+    const token = signToken({ sub: user.id, email: normalizedEmail });
+    res.json({ token, user: profile.rows[0] || { id: user.id, email: normalizedEmail } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
