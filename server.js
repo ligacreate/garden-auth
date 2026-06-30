@@ -132,6 +132,57 @@ const RL_HOURLY_MAX = 50;
 const recentByKey = new Map();
 const hourlyByIp = new Map();
 
+// MON-002 — приглушение benign клиентских ошибок: глушим поштучно,
+// алертим ОДИН агрегат только при кучковании за скользящее 60-мин окно.
+// Категории и пороги (events/час) тюнятся здесь. Счётчик — в памяти процесса
+// (garden-auth = один процесс `node server.js`, без cluster/pm2 — Map ок;
+// рестарт обнуляет окна, для админ-мониторинга приемлемо).
+const BENIGN_WINDOW_MS = 60 * 60 * 1000;          // окно скользящего счётчика
+const BENIGN_ALERT_COOLDOWN_MS = 60 * 60 * 1000;  // не чаще 1 агрегата / категорию / час
+const BENIGN_THRESHOLDS = {
+  jwt_expired: 10,            // >10/час → всплеск протухших подписей / PostgREST 401
+  chunk_autoreload: 15,       // >15/час → зацикленный reload / битый деплой
+  failed_fetch: 8,            // >8/час  → сетевой/CORS-инцидент
+  pvl_hydrate_degradation: 8, // >8/час  → деградация гидрации ПВЛ
+};
+// per-category: { hits: number[] (timestamps в окне), lastAlertTs, dayCount }
+const benignState = new Map();
+
+// MON-002 — отнести входящее событие к benign-категории или 'other'.
+// Классифицируем на сервере по message/source/code (клиент шлёт их как есть).
+const classifyClientError = ({ message, source, code }) => {
+  const msg = message || '';
+  const src = source || '';
+  if (msg.includes('JWT expired') || code === 'PGRST303') return 'jwt_expired';
+  if (src === 'ErrorBoundary.chunkLoad'
+      || msg.includes('ChunkLoadError')
+      || msg.includes('Importing a module script failed')
+      || msg.includes('Failed to fetch dynamically imported module')) return 'chunk_autoreload';
+  if (msg === 'Failed to fetch' || msg === 'TypeError: Failed to fetch') return 'failed_fetch';
+  if (msg.includes('loadRuntimeSnapshot partial degradation')
+      || msg.includes('hydrate_mentor_links failed')
+      || src.startsWith('pvlMockApi.hydrate')) return 'pvl_hydrate_degradation';
+  return 'other';
+};
+
+// MON-002 — учесть benign-событие в скользящем окне; вернуть текст агрегата,
+// если пора алертить (порог превышен и кулдаун прошёл), иначе null.
+const recordBenign = (category, now) => {
+  let st = benignState.get(category);
+  if (!st) { st = { hits: [], lastAlertTs: 0, dayCount: 0 }; benignState.set(category, st); }
+  st.hits.push(now);
+  const cutoff = now - BENIGN_WINDOW_MS;
+  while (st.hits.length && st.hits[0] < cutoff) st.hits.shift();
+  st.dayCount += 1;
+  const threshold = BENIGN_THRESHOLDS[category];
+  if (st.hits.length > threshold && now - st.lastAlertTs > BENIGN_ALERT_COOLDOWN_MS) {
+    st.lastAlertTs = now;
+    return `⚠️ *${category}* ×${st.hits.length} за час (кучкование)\n`
+      + `Порог >${threshold}/час превышен — похоже на реальный инцидент, проверь.`;
+  }
+  return null;
+};
+
 // IPv4-only POST (обходим happy-eyeballs в node fetch — на этом сервере
 // IPv6 outbound к api.telegram.org даёт ENETUNREACH, см.
 // docs/_session/2026-05-10_05_codeexec_p1_backend_deployed.md).
@@ -303,6 +354,34 @@ const logClientError = (obj) => {
   } catch { /* ignore */ }
 };
 
+// MON-002 — общий sender админ-алерта в @garden_grants_monitor_bot
+// (агрегат при кучковании + суточный дайджест). Reuse того же IPv4-only
+// httpsPostJson; ошибку TG пишем в CLIENT_ERROR_LOG, не роняем вызывающего.
+const postAdminTg = async (text) => {
+  if (!TG_API || !TG_CHAT_ID) return;
+  const tgRes = await httpsPostJson(TG_API, {
+    chat_id: TG_CHAT_ID, text, parse_mode: 'Markdown', disable_web_page_preview: true,
+  }).catch((e) => ({ ok: false, status: 0, text: String(e?.message || e) }));
+  if (!tgRes.ok) {
+    logClientError({
+      ts: new Date().toISOString(), level: 'tg-failed',
+      status: tgRes.status, body: String(tgRes.text || '').slice(0, 500),
+    });
+  }
+};
+
+// MON-002 — раз в сутки короткий дайджест benign-фона: чтобы фон был виден,
+// но не дёргал поштучно. Молчим, если за сутки ничего не накопилось.
+setInterval(() => {
+  const cats = Object.keys(BENIGN_THRESHOLDS);
+  const total = cats.reduce((s, c) => s + (benignState.get(c)?.dayCount || 0), 0);
+  if (total > 0) {
+    const parts = cats.map((c) => `${c} ×${benignState.get(c)?.dayCount || 0}`);
+    postAdminTg(`📊 *benign за сутки*: ${parts.join(', ')}`);
+  }
+  for (const c of cats) { const st = benignState.get(c); if (st) st.dayCount = 0; }
+}, 24 * 60 * 60 * 1000).unref();
+
 app.post('/api/client-error', async (req, res) => {
   res.status(204).end();
 
@@ -345,6 +424,26 @@ app.post('/api/client-error', async (req, res) => {
       ts: new Date().toISOString(),
       ip, msgHash, source, message, stack, url, userAgent, bundleId, bundleScript, user,
     });
+
+    // MON-002 — benign-категории: в TG поштучно НЕ шлём, копим в окне, алертим
+    // один агрегат при кучковании. FAIL-OPEN: любой сбой throttle-логики →
+    // проваливаемся к обычной пересылке 'other' ниже (ничего не глотаем, не
+    // роняем /api/client-error и тем более несвязанные /api/* login/reset).
+    try {
+      const category = classifyClientError({ message, source, code: body.code });
+      if (category !== 'other') {
+        const alert = recordBenign(category, now);
+        if (alert) await postAdminTg(alert);
+        return;
+      }
+    } catch (throttleErr) {
+      logClientError({
+        ts: new Date().toISOString(),
+        level: 'mon002-throttle-error',
+        error: String(throttleErr?.message || throttleErr),
+      });
+      // не return — событие уйдёт в TG как 'other' ниже (fail-open).
+    }
 
     if (!TG_API || !TG_CHAT_ID) return;
 
